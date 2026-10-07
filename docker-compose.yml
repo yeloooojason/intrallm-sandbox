@@ -1,0 +1,27 @@
+services:
+  sandbox-image:
+    # Builds the default sandbox image only; the container exits immediately.
+    build: ./sandbox-image
+    image: intrallm/sandbox:latest
+    command: ["true"]
+
+  control-plane:
+    build: .
+    image: intrallm/sandbox-control:latest
+    depends_on: [sandbox-image]
+    ports:
+      - "8080:8080"
+    environment:
+      SANDBOX_RUNTIME: docker
+      SANDBOX_ADMIN_TOKEN: ${SANDBOX_ADMIN_TOKEN:?set SANDBOX_ADMIN_TOKEN}
+      SANDBOX_DEFAULT_IMAGE: intrallm/sandbox:latest
+      SANDBOX_NETWORK: none
+      SANDBOX_MAX_PER_OWNER: "5"
+      SANDBOX_MAX_TOTAL: "100"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - sandbox-data:/data
+    restart: unless-stopped
+
+volumes:
+  sandbox-data:

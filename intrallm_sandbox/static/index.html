@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IntraLLM Sandbox</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">▣</span>
+      <span>IntraLLM Sandbox</span>
+      <span class="badge" id="runtime-badge">—</span>
+    </div>
+    <div class="topbar-right">
+      <span class="live" id="live"><span class="dot"></span><span id="updated">—</span></span>
+      <span class="who" id="who"></span>
+      <button class="btn ghost" id="logout">退出</button>
+    </div>
+  </header>
+
+  <main class="page" id="app" hidden>
+    <section class="kpis" id="kpis"></section>
+
+    <section class="grid-2" id="host-charts">
+      <div class="card">
+        <div class="card-head"><h2>宿主机 CPU</h2><span class="muted" id="host-cpu-now"></span></div>
+        <div class="chart" id="chart-host-cpu"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>宿主机内存</h2><span class="muted" id="host-mem-now"></span></div>
+        <div class="chart" id="chart-host-mem"></div>
+      </div>
+    </section>
+
+    <section class="grid-main">
+      <div class="card">
+        <div class="card-head">
+          <h2>沙箱</h2>
+          <div class="toolbar">
+            <input type="search" id="filter" placeholder="搜索 ID / 名称 / 用户">
+            <select id="status-filter">
+              <option value="active">运行中</option>
+              <option value="all">全部</option>
+            </select>
+            <button class="btn primary" id="new-btn">＋ 新建沙箱</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>沙箱</th><th>分配给</th><th>创建者</th><th>状态</th>
+                <th class="num">CPU</th><th class="num">内存</th><th class="num">运行时长</th><th class="num">剩余</th><th></th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+          <div class="empty" id="empty" hidden>暂无沙箱</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>按用户分配</h2></div>
+        <div id="owners" class="owners"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- login -->
+  <div class="overlay" id="login" hidden>
+    <form class="dialog" id="login-form">
+      <h2>登录</h2>
+      <p class="muted">输入管理员或用户 API Token。</p>
+      <input type="password" id="token-input" placeholder="isb_..." autocomplete="current-password" required>
+      <p class="error" id="login-error"></p>
+      <button class="btn primary" type="submit">进入控制台</button>
+    </form>
+  </div>
+
+  <!-- create -->
+  <div class="overlay" id="create" hidden>
+    <form class="dialog" id="create-form">
+      <h2>新建沙箱</h2>
+      <label>分配给（用户）<input name="owner" placeholder="默认为当前账号"></label>
+      <label>名称<input name="name" placeholder="可选"></label>
+      <label>镜像<input name="image" placeholder="默认镜像"></label>
+      <div class="row">
+        <label>CPU 核<input name="cpu" type="number" step="0.25" min="0.25" value="1"></label>
+        <label>内存 MB<input name="memory_mb" type="number" step="256" min="64" value="1024"></label>
+        <label>有效期 分钟<input name="ttl_min" type="number" min="1" value="60"></label>
+      </div>
+      <p class="error" id="create-error"></p>
+      <div class="actions">
+        <button class="btn ghost" type="button" data-close>取消</button>
+        <button class="btn primary" type="submit">创建</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- detail drawer -->
+  <aside class="drawer" id="drawer" hidden>
+    <div class="drawer-head">
+      <div>
+        <h2 id="d-title"></h2>
+        <div class="muted mono" id="d-id"></div>
+      </div>
+      <button class="btn ghost" id="d-close" aria-label="关闭">✕</button>
+    </div>
+    <div class="drawer-body">
+      <dl class="facts" id="d-facts"></dl>
+      <div class="card flat">
+        <div class="card-head"><h3>CPU</h3><span class="muted" id="d-cpu-now"></span></div>
+        <div class="chart small" id="chart-sb-cpu"></div>
+      </div>
+      <div class="card flat">
+        <div class="card-head"><h3>内存</h3><span class="muted" id="d-mem-now"></span></div>
+        <div class="chart small" id="chart-sb-mem"></div>
+      </div>
+      <div class="card flat" id="d-console-card">
+        <div class="card-head"><h3>命令</h3></div>
+        <form id="d-console" class="console-form">
+          <input id="d-cmd" class="mono" placeholder="例如: python3 -V" autocomplete="off">
+          <button class="btn" type="submit">执行</button>
+        </form>
+        <pre class="console" id="d-output"></pre>
+      </div>
+      <div class="card flat">
+        <div class="card-head"><h3>审计日志</h3></div>
+        <ul class="audit" id="d-audit"></ul>
+      </div>
+      <div class="actions">
+        <button class="btn" id="d-extend">延长 1 小时</button>
+        <button class="btn danger" id="d-stop">停止并销毁</button>
+      </div>
+    </div>
+  </aside>
+
+  <div class="tooltip" id="tooltip" hidden></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
