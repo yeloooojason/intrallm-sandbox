@@ -19,7 +19,9 @@ from .base import (
 )
 
 LABEL = "intrallm.sandbox"
+NET_LABEL = "intrallm.sandbox.network"
 WORKDIR = "/workspace"
+ISOLATED = "isolated"
 
 
 def _abs(path: str) -> str:
@@ -45,32 +47,76 @@ class DockerRuntime(Runtime):
         except self._docker.errors.NotFound as e:
             raise RuntimeError_(f"container {handle[:12]} not found") from e
 
+    def _isolated_network(self, spec: SandboxSpec) -> str:
+        """A private internal network per sandbox: no route out, no other sandboxes,
+        only the configured peers (the egress proxy)."""
+        name = f"intrallm-net-{spec.sandbox_id}"
+        net = self.client.networks.create(
+            name, driver="bridge", internal=True, labels={LABEL: "1", NET_LABEL: name}
+        )
+        try:
+            for peer in spec.network_peers:
+                net.connect(peer)
+        except Exception:
+            self._remove_network(name)
+            raise
+        return name
+
+    def _remove_network(self, name: str) -> None:
+        try:
+            net = self.client.networks.get(name)
+        except self._docker.errors.NotFound:
+            return
+        net.reload()
+        for c in net.containers:
+            try:
+                net.disconnect(c, force=True)
+            except self._docker.errors.APIError:
+                pass
+        try:
+            net.remove()
+        except self._docker.errors.APIError:
+            pass
+
     def create(self, spec: SandboxSpec) -> str:
+        network = spec.network
+        labels = {LABEL: "1", "intrallm.sandbox.id": spec.sandbox_id, **spec.labels}
+        if network == ISOLATED:
+            network = self._isolated_network(spec)
+            labels[NET_LABEL] = network
         kwargs = dict(
             image=spec.image,
-            command=["sleep", "infinity"],
             name=f"intrallm-sbx-{spec.sandbox_id}",
             detach=True,
-            labels={LABEL: "1", "intrallm.sandbox.id": spec.sandbox_id, **spec.labels},
+            labels=labels,
             environment=spec.env,
             working_dir=WORKDIR,
             nano_cpus=int(spec.cpu * 1e9),
             mem_limit=f"{spec.memory_mb}m",
             memswap_limit=f"{spec.memory_mb}m",
             pids_limit=spec.pids_limit,
-            network_mode=spec.network,
+            network_mode=network,
             cap_drop=["ALL"],
             security_opt=["no-new-privileges:true"],
             init=True,
             auto_remove=False,
         )
+        if spec.command is not None:
+            kwargs["command"] = spec.command
+        if spec.shm_size_mb:
+            kwargs["shm_size"] = f"{spec.shm_size_mb}m"
         if spec.user:
             kwargs["user"] = spec.user
         try:
-            container = self.client.containers.run(**kwargs)
-        except self._docker.errors.ImageNotFound:
-            self.client.images.pull(spec.image)
-            container = self.client.containers.run(**kwargs)
+            try:
+                container = self.client.containers.run(**kwargs)
+            except self._docker.errors.ImageNotFound:
+                self.client.images.pull(spec.image)
+                container = self.client.containers.run(**kwargs)
+        except Exception:
+            if NET_LABEL in labels:
+                self._remove_network(labels[NET_LABEL])
+            raise
         # Ensure the workspace exists even on images that don't ship it.
         container.exec_run(["mkdir", "-p", WORKDIR])
         return container.id
@@ -174,9 +220,13 @@ class DockerRuntime(Runtime):
 
     def destroy(self, handle):
         try:
-            self._container(handle).remove(force=True)
+            c = self._container(handle)
         except RuntimeError_:
-            pass
+            return
+        network = c.labels.get(NET_LABEL)
+        c.remove(force=True)
+        if network:
+            self._remove_network(network)
 
     def list_handles(self):
         return [c.id for c in self.client.containers.list(all=True, filters={"label": LABEL})]

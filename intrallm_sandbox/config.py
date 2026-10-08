@@ -46,6 +46,25 @@ class Settings:
     network: str = field(default_factory=lambda: _env("NETWORK", "none"))
     container_user: str = field(default_factory=lambda: _env("CONTAINER_USER", ""))
 
+    # Desktop template (virtual screen + Chromium, driven by computer-use / Playwright tools)
+    desktop_image: str = field(default_factory=lambda: _env("DESKTOP_IMAGE", "intrallm/sandbox-desktop:latest"))
+    desktop_cpu: float = field(default_factory=lambda: _env_float("DESKTOP_CPU", 2.0))
+    desktop_memory_mb: int = field(default_factory=lambda: _env_int("DESKTOP_MEMORY_MB", 2048))
+    desktop_shm_mb: int = field(default_factory=lambda: _env_int("DESKTOP_SHM_MB", 1024))
+    desktop_pids_limit: int = field(default_factory=lambda: _env_int("DESKTOP_PIDS_LIMIT", 1024))
+    # The browser needs network. Point this at an internal Docker network whose only
+    # way out is the egress proxy (see docker-compose.yml), never plain "bridge" in prod.
+    # "isolated" = a private internal network per sandbox with only DESKTOP_NETWORK_PEERS
+    # attached (recommended, see docker-compose.yml); or any Docker network name.
+    desktop_network: str = field(default_factory=lambda: _env("DESKTOP_NETWORK", "bridge"))
+    desktop_network_peers: list[str] = field(
+        default_factory=lambda: [p for p in _env("DESKTOP_NETWORK_PEERS", "").split(",") if p]
+    )
+    desktop_proxy: str = field(default_factory=lambda: _env("DESKTOP_PROXY", ""))
+    desktop_home: str = field(default_factory=lambda: _env("DESKTOP_HOME", "about:blank"))
+    max_desktops_per_owner: int = field(default_factory=lambda: _env_int("MAX_DESKTOPS_PER_OWNER", 2))
+    desktop_action_timeout: int = field(default_factory=lambda: _env_int("DESKTOP_ACTION_TIMEOUT", 90))
+
     # Lifecycle (seconds)
     default_ttl: int = field(default_factory=lambda: _env_int("DEFAULT_TTL", 3600))
     max_ttl: int = field(default_factory=lambda: _env_int("MAX_TTL", 24 * 3600))

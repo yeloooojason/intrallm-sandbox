@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import secrets
+import shlex
 import threading
 import time
 from collections import deque
@@ -43,6 +45,11 @@ class QuotaExceeded(SandboxError):
 
 class Conflict(SandboxError):
     status_code = 409
+
+
+TEMPLATES = ("code", "desktop")
+# Desktop actions that only observe; they are not written to the audit log.
+READ_ONLY_DESKTOP = {"screenshot", "cursor_position", "snapshot", "tabs", "wait", "wait_for"}
 
 
 class MetricsStore:
@@ -186,6 +193,7 @@ class SandboxManager:
         principal: Principal,
         owner: str | None = None,
         name: str | None = None,
+        template: str | None = None,
         image: str | None = None,
         cpu: float | None = None,
         memory_mb: int | None = None,
@@ -199,11 +207,17 @@ class SandboxManager:
                 raise Forbidden("users can only allocate sandboxes to themselves")
             owner = principal.name
         owner = owner or principal.name
-        image = image or s.default_image
+        template = template or "code"
+        if template not in TEMPLATES:
+            raise SandboxError(f"template must be one of {TEMPLATES}")
+        desktop = template == "desktop"
+        image = image or (s.desktop_image if desktop else s.default_image)
         if s.allowed_images and image not in s.allowed_images:
             raise SandboxError(f"image {image!r} is not in the allowed list")
-        cpu = cpu if cpu is not None else s.default_cpu
-        memory_mb = memory_mb if memory_mb is not None else s.default_memory_mb
+        if cpu is None:
+            cpu = s.desktop_cpu if desktop else s.default_cpu
+        if memory_mb is None:
+            memory_mb = s.desktop_memory_mb if desktop else s.default_memory_mb
         if not (0 < cpu <= s.max_cpu):
             raise SandboxError(f"cpu must be in (0, {s.max_cpu}]")
         if not (64 <= memory_mb <= s.max_memory_mb):
@@ -217,9 +231,12 @@ class SandboxManager:
                 raise QuotaExceeded(f"cluster limit reached ({s.max_total} active sandboxes)")
             if self.db.count_active(owner) >= s.max_per_owner:
                 raise QuotaExceeded(f"{owner} already has {s.max_per_owner} active sandboxes")
+            if desktop and self.db.count_active(owner, "desktop") >= s.max_desktops_per_owner:
+                raise QuotaExceeded(f"{owner} already has {s.max_desktops_per_owner} active desktop sandboxes")
             record = {
                 "id": sandbox_id,
                 "name": name or sandbox_id,
+                "template": template,
                 "owner": owner,
                 "created_by": principal.name,
                 "status": "creating",
@@ -235,25 +252,44 @@ class SandboxManager:
             }
             self.db.insert_sandbox(record)
 
+        env = dict(env or {})
+        if desktop:
+            if s.desktop_proxy:
+                env.setdefault("BROWSER_PROXY", s.desktop_proxy)
+            env.setdefault("BROWSER_HOME", s.desktop_home)
         spec = SandboxSpec(
             sandbox_id=sandbox_id,
             image=image,
             cpu=cpu,
             memory_mb=memory_mb,
-            pids_limit=s.pids_limit,
-            network=s.network,
-            env=env or {},
-            labels={"intrallm.sandbox.owner": owner, "intrallm.sandbox.created_by": principal.name},
+            pids_limit=s.desktop_pids_limit if desktop else s.pids_limit,
+            network=s.desktop_network if desktop else s.network,
+            env=env,
+            labels={
+                "intrallm.sandbox.owner": owner,
+                "intrallm.sandbox.created_by": principal.name,
+                "intrallm.sandbox.template": template,
+            },
             user=s.container_user,
+            command=None if desktop else ["sleep", "infinity"],
+            shm_size_mb=s.desktop_shm_mb if desktop else None,
+            network_peers=s.desktop_network_peers if desktop else [],
         )
+        handle = None
         try:
             handle = self.runtime.create(spec)
+            if desktop:
+                self._desktopctl(handle, {"action": "wait_ready", "timeout": 45}, timeout=60)
         except Exception as e:
+            if handle:
+                self.runtime.destroy(handle)
             self.db.update_sandbox(sandbox_id, status="error", terminated_at=time.time(), terminate_reason=str(e)[:500])
             self.db.audit(principal.name, "create_failed", sandbox_id, error=str(e)[:500])
             raise SandboxError(f"failed to start sandbox: {e}") from e
         self.db.update_sandbox(sandbox_id, status="running", handle=handle)
-        self.db.audit(principal.name, "create", sandbox_id, owner=owner, image=image, cpu=cpu, memory_mb=memory_mb)
+        self.db.audit(
+            principal.name, "create", sandbox_id, owner=owner, template=template, image=image, cpu=cpu, memory_mb=memory_mb
+        )
         return self.db.get_sandbox(sandbox_id)
 
     def get(self, principal: Principal, sandbox_id: str) -> dict[str, Any]:
@@ -331,6 +367,47 @@ class SandboxManager:
             raise NotFound(str(e)) from e
         self.db.touch_sandbox(sandbox_id)
         return entries
+
+    # --- desktop (computer use + browser) ----------------------------------
+    def _desktopctl(self, handle: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+        cmd = "desktopctl " + shlex.quote(json.dumps(payload, ensure_ascii=False))
+        res = self.runtime.exec(handle, cmd, timeout, max_output=32 * 1024 * 1024)
+        if res.timed_out:
+            raise SandboxError(f"desktop action timed out after {timeout}s")
+        try:
+            out = json.loads(res.stdout)
+        except ValueError:
+            detail = (res.stderr or res.stdout).strip()[-500:]
+            raise SandboxError(f"desktop controller failed (exit {res.exit_code}): {detail}")
+        if not out.pop("ok", False):
+            raise SandboxError(out.get("error", "desktop action failed"))
+        return out
+
+    def desktop_action(
+        self, principal: Principal, sandbox_id: str, tool: str, args: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Run a ``computer`` (screen/mouse/keyboard) or ``browser`` (Playwright) action."""
+        if tool not in ("computer", "browser"):
+            raise SandboxError("tool must be 'computer' or 'browser'")
+        sb = self._running(principal, sandbox_id)
+        if sb["template"] != "desktop":
+            raise Conflict(f"sandbox {sandbox_id} has no desktop (template={sb['template']})")
+        action = args.get("action")
+        if not action:
+            raise SandboxError("action is required")
+        payload = {**args, "tool": tool}
+        out = self._desktopctl(sb["handle"], payload, self.settings.desktop_action_timeout)
+        self.db.touch_sandbox(sandbox_id)
+        if action not in READ_ONLY_DESKTOP:
+            detail = {k: v for k, v in args.items() if k not in ("text", "action")}
+            if "text" in args:
+                if tool == "computer" and action == "key":
+                    detail["keys"] = str(args["text"])[:100]
+                else:
+                    # Never log what was typed or filled in: it may be a password.
+                    detail["text_len"] = len(str(args["text"]))
+            self.db.audit(principal.name, f"{tool}.{action}", sandbox_id, **detail)
+        return out
 
     def extend(self, principal: Principal, sandbox_id: str, seconds: int) -> dict[str, Any]:
         sb = self._running(principal, sandbox_id)

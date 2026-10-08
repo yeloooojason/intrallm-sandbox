@@ -1,14 +1,17 @@
 # IntraLLM Sandbox
 
-企业级代码执行沙箱控制平面，供 **IntraLLM agent** 调用。它包含三部分：
+企业级沙箱控制平面，供 **IntraLLM agent** 调用。它包含四部分：
 
 - **沙箱运行时**：每个沙箱是一个加固的 Docker 容器，有 CPU、内存和进程数限制，默认不能联网，也没有任何 Linux capability。
+- **桌面沙箱（Computer Use）**：沙箱内带虚拟桌面和 Chromium。agent 既可以像人一样看截图、按坐标点击和打字，也可以用 Playwright 按元素编号操作同一个浏览器。用户可以在 Dashboard 上实时观看，并随时接管。
 - **控制 API 与 Agent 工具**：提供 REST API，以及 OpenAI 兼容格式的 function-calling 工具定义，IntraLLM agent 可以直接接入。
 - **监控 Dashboard**：显示运行中的沙箱数量、每个沙箱分配给了谁、CPU 和内存占用、宿主机负载趋势，以及审计日志。
 
 ![dashboard](docs/dashboard-light.png)
 
 ![detail](docs/drawer.png)
+
+![desktop](docs/desktop-live.png)
 
 ## 架构
 
@@ -39,6 +42,8 @@
 | `intrallm_sandbox/api.py` | REST API、`/metrics`（Prometheus 格式），以及 Dashboard 静态页面 |
 | `intrallm_sandbox/client.py` | Python SDK，以及给 agent 用的 `AgentToolkit` |
 | `intrallm_sandbox/static/` | Dashboard 前端（原生 JS 加 SVG 图表，没有外部 CDN 依赖，可以直接在内网部署） |
+| `sandbox-desktop/` | 桌面沙箱镜像：Xvfb、Openbox、Chromium，以及沙箱内的控制器 `desktopctl` |
+| `deploy/egress-proxy/` | 桌面沙箱的出口代理（Squid）配置和域名白名单 |
 
 ## 快速开始
 
@@ -69,6 +74,66 @@ SANDBOX_RUNTIME=local SANDBOX_ADMIN_TOKEN=dev python -m intrallm_sandbox serve
 
 pytest            # 单元测试和 API 测试；检测到 Docker 时会自动跑 Docker 集成测试
 ```
+
+## 桌面沙箱：Computer Use + Playwright
+
+```
+                      IntraLLM agent
+           ┌───────────────┴────────────────┐
+     computer 工具                       browser 工具
+  (截图 / 坐标点击 / 键盘)        (navigate / snapshot / click ref / fill)
+           │   POST /desktop/computer        │   POST /desktop/browser
+           ▼                                 ▼
+  ┌──────────────── 桌面沙箱容器 (docker exec desktopctl) ────────────────┐
+  │  Xvfb :1 (1280x800)  ←── XTEST 鼠标键盘 / 截图 (python-xlib)            │
+  │    └─ Chromium  ←── Playwright connect_over_cdp(127.0.0.1:9222)        │
+  └────────────────────────────┬──────────────────────────────────────────┘
+                               │ 独立的 internal 网络，只连着代理
+                        Squid 出口代理 (域名白名单，默认禁止访问内网网段)
+                               │
+                   允许的内网系统 / 外网网站
+```
+
+两类工具操作的是**同一个、看得见的 Chromium**，可以混着用：
+
+- **`browser`（优先使用）**：返回页面的文字快照，例如 `[3] button "提交" @418,604`。agent 用编号点击和填写，快速、稳定、省 token，纯文本模型也能用。快照里还带有元素的屏幕坐标，可以直接交给 `computer` 使用。
+- **`computer`（兜底）**：截图加坐标点击和键盘，支持中文输入。适用于 canvas、原生对话框、需要视觉确认的场景和非浏览器程序。需要具备视觉能力的模型，比如 Qwen2.5-VL、UI-TARS。每个动作默认都会返回一张新截图。
+
+使用方式：
+
+```bash
+# 创建桌面沙箱
+POST /api/v1/sandboxes {"template": "desktop", "owner": "alice"}
+# 或者让 agent 调用 sandbox_create {"template": "desktop"}
+
+POST /api/v1/sandboxes/{id}/desktop/browser  {"action": "navigate", "url": "http://oa.corp"}
+POST /api/v1/sandboxes/{id}/desktop/browser  {"action": "fill", "ref": 1, "text": "张伟"}
+POST /api/v1/sandboxes/{id}/desktop/computer {"action": "left_click", "coordinate": [418, 604]}
+POST /api/v1/sandboxes/{id}/desktop/computer {"action": "type", "text": "上海出差"}
+GET  /api/v1/sandboxes/{id}/desktop/screen?format=jpeg   # 当前画面
+```
+
+- **截图怎么交给模型**：OpenAI 兼容接口的 `tool` 消息只能放文本，所以 `AgentToolkit.messages()` 会把截图拆成一条带 `image_url` 的 user 消息。`prune_screenshots()` 只保留最近几张截图，避免撑爆上下文。完整示例见 `examples/intrallm_agent_loop.py`。
+- **实时画面与人工接管**：在 Dashboard 里打开桌面沙箱，可以看到实时画面（约 1 秒刷新一次）。勾选“接管控制”后，可以直接在画面上点击、双击、右键、滚动和键盘输入；中文请用下方的输入框发送。人工操作和 agent 操作分别以各自的身份记入审计日志。
+- **审计**：每个动作都会记入审计日志。`type` 和 `fill` 只记录字符数，不记录内容，以免泄露密码。
+
+构建镜像：
+
+```bash
+docker build -t intrallm/sandbox-desktop:latest sandbox-desktop/
+# 离线或内网构建（没有 apt 源时，跳过 Openbox、xterm 和中文字体）：
+docker build --build-arg DESKTOP_EXTRAS=0 -t intrallm/sandbox-desktop:latest sandbox-desktop/
+```
+
+### 桌面沙箱的网络隔离
+
+浏览器必须能联网，所以这是安全上最需要注意的部分。`docker compose` 默认的部署方式是：
+
+- **每个桌面沙箱一个独立的 internal 网络**（`SANDBOX_DESKTOP_NETWORK=isolated`），网络上只连着出口代理。沙箱之间无法互访，也不能绕过代理直接出网。
+- **Squid 出口代理**：只有 `deploy/egress-proxy/allowlist.txt` 里的外网域名可以访问。内网地址段（10/8、172.16/12、192.168/16、169.254/16 等，含云平台元数据地址）一律禁止，除非域名列在 `intranet-allowlist.txt` 里。这样可以防止 agent 被网页上的提示注入引导去访问内网的其他系统（SSRF）。代理的访问日志会记录每个沙箱访问过的地址。
+- **代码沙箱**仍然是 `network=none`，完全断网。
+
+在本仓库的开发环境里实测过：允许的内网系统可以打开；未列入白名单的内网系统和外网域名会被代理拒绝；绕过代理直连（按域名或按 IP）都不通；沙箱之间互相访问也不通；销毁沙箱时，它的网络会一并删除。
 
 ## 角色与权限
 
@@ -105,7 +170,7 @@ for call in resp.choices[0].message.tool_calls:
                      "content": kit.call(call.function.name, call.function.arguments)})
 ```
 
-提供的工具：`sandbox_create`、`sandbox_exec`、`sandbox_write_file`、`sandbox_read_file`、`sandbox_list_files`、`sandbox_list`、`sandbox_destroy`。
+提供的工具：`sandbox_create`、`sandbox_exec`、`sandbox_write_file`、`sandbox_read_file`、`sandbox_list_files`、`sandbox_list`、`sandbox_destroy`，以及桌面沙箱专用的 `computer` 和 `browser`。
 
 ## REST API
 
@@ -121,6 +186,9 @@ for call in resp.choices[0].message.tool_calls:
 | GET | `/api/v1/sandboxes/{id}/ls?path=` | 列出目录 |
 | POST | `/api/v1/sandboxes/{id}/extend` | 延长有效期 `{seconds}` |
 | POST | `/api/v1/sandboxes/{id}/reassign` | 改分配给别的用户 `{owner}`（admin 和 agent 可用） |
+| POST | `/api/v1/sandboxes/{id}/desktop/computer` | Computer Use 动作：截图、点击、键盘、滚动、拖拽 |
+| POST | `/api/v1/sandboxes/{id}/desktop/browser` | Playwright 动作：打开网页、页面快照、点击、填写、管理标签页 |
+| GET | `/api/v1/sandboxes/{id}/desktop/screen` | 当前桌面画面（PNG 或 JPEG） |
 | GET | `/api/v1/sandboxes/{id}/metrics` | 该沙箱的 CPU 和内存历史 |
 | GET | `/api/v1/sandboxes/{id}/audit` | 该沙箱的审计日志 |
 | GET | `/api/v1/dashboard/summary` | Dashboard 汇总数据：运行数、各用户分配情况、资源占用、宿主机趋势 |
@@ -145,6 +213,13 @@ for call in resp.choices[0].message.tool_calls:
 | `SANDBOX_EXEC_TIMEOUT` / `SANDBOX_MAX_EXEC_TIMEOUT` | `60` / `600` | 单条命令的超时（秒） |
 | `SANDBOX_MAX_PER_OWNER` / `SANDBOX_MAX_TOTAL` | `5` / `100` | 每个用户和全集群的沙箱数量上限 |
 | `SANDBOX_METRICS_INTERVAL` | `5` | 指标采样间隔（秒） |
+| `SANDBOX_DESKTOP_IMAGE` | `intrallm/sandbox-desktop:latest` | 桌面沙箱镜像 |
+| `SANDBOX_DESKTOP_CPU` / `SANDBOX_DESKTOP_MEMORY_MB` / `SANDBOX_DESKTOP_SHM_MB` | `2` / `2048` / `1024` | 桌面沙箱的默认资源 |
+| `SANDBOX_DESKTOP_NETWORK` | `bridge` | 生产环境请设为 `isolated`（每个沙箱一个独立网络），见上文 |
+| `SANDBOX_DESKTOP_NETWORK_PEERS` | 空 | `isolated` 模式下连入沙箱网络的容器（出口代理） |
+| `SANDBOX_DESKTOP_PROXY` | 空 | 浏览器使用的代理，例如 `http://intrallm-egress-proxy:3128` |
+| `SANDBOX_DESKTOP_HOME` | `about:blank` | 浏览器启动后打开的首页 |
+| `SANDBOX_MAX_DESKTOPS_PER_OWNER` | `2` | 每个用户最多同时拥有的桌面沙箱数 |
 
 ## 安全说明
 
@@ -153,6 +228,8 @@ for call in resp.choices[0].message.tool_calls:
 - 隔离要求更高时，可以给 Docker 配置 [gVisor](https://gvisor.dev)（`runsc`）或 Kata Containers 作为 runtime。
 - 数据库里只存 token 的 SHA-256 哈希。所有 exec 和文件写入都会记入审计日志。
 - `/metrics` 不需要认证，但输出里带有用户名，应当只开放给内网的 Prometheus。
+- 桌面沙箱里的 Chromium 以 `--no-sandbox` 启动：Chromium 自带的沙箱需要用户命名空间，而加固后的容器不提供。此时容器本身就是隔离边界。需要两层隔离时，可以给容器配置专门的 seccomp 策略，或者换用 gVisor。
+- 网页内容可能包含提示注入。示例里的系统提示词要求模型把网页内容当作数据而不是指令，并在付款、删除、发送消息之前先征得用户同意。真正的防线还是出口白名单和人工接管。
 
 ## 后续可以扩展
 
@@ -160,3 +237,5 @@ for call in resp.choices[0].message.tool_calls:
 - 对接企业 SSO（OIDC/LDAP），替代静态 token
 - 持久化工作区卷，以及沙箱快照
 - 提供 MCP Server 形式的工具接口
+- 用 noVNC 提供更流畅的实时画面，以及录屏回放
+- 使用 Windows 软件时，增加 Windows 虚拟机运行时

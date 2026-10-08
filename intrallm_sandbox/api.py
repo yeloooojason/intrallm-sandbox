@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,6 +28,7 @@ STATIC = Path(__file__).parent / "static"
 class CreateSandbox(BaseModel):
     owner: str | None = Field(None, description="User the sandbox is allocated to (agents/admins only)")
     name: str | None = None
+    template: str | None = Field(None, description="'code' (default) or 'desktop'")
     image: str | None = None
     cpu: float | None = None
     memory_mb: int | None = None
@@ -163,6 +164,26 @@ def create_app(settings: Settings | None = None, runtime: Runtime | None = None)
     @app.post("/api/v1/sandboxes/{sandbox_id}/reassign")
     def reassign(sandbox_id: str, body: Reassign, p: Principal = Depends(principal)):
         return manager.view(manager.reassign(p, sandbox_id, body.owner))
+
+    # --- desktop: computer use + browser ------------------------------------
+    @app.post("/api/v1/sandboxes/{sandbox_id}/desktop/{tool}")
+    def desktop_action(sandbox_id: str, tool: str, body: dict[str, Any], p: Principal = Depends(principal)):
+        """Run a `computer` or `browser` action, e.g. {"action": "left_click", "coordinate": [100, 200]}."""
+        return manager.desktop_action(p, sandbox_id, tool, body)
+
+    @app.get("/api/v1/sandboxes/{sandbox_id}/desktop/screen")
+    def desktop_screen(
+        sandbox_id: str,
+        format: str = Query("jpeg", pattern="^(png|jpeg)$"),
+        quality: int = Query(60, ge=10, le=95),
+        max_width: int | None = Query(None, ge=160, le=4096),
+        p: Principal = Depends(principal),
+    ):
+        """Current screen as an image (used by the dashboard live view)."""
+        args = {"action": "screenshot", "format": format, "quality": quality, "max_width": max_width}
+        out = manager.desktop_action(p, sandbox_id, "computer", args)
+        img = out["image"]
+        return Response(base64.b64decode(img["data"]), media_type=img["media_type"], headers={"Cache-Control": "no-store"})
 
     @app.get("/api/v1/sandboxes/{sandbox_id}/metrics")
     def sandbox_metrics(sandbox_id: str, p: Principal = Depends(principal)):

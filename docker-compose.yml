@@ -1,14 +1,32 @@
 services:
+  # Build-only services for the sandbox images; the containers exit immediately.
   sandbox-image:
-    # Builds the default sandbox image only; the container exits immediately.
     build: ./sandbox-image
     image: intrallm/sandbox:latest
     command: ["true"]
 
+  sandbox-desktop-image:
+    build: ./sandbox-desktop
+    image: intrallm/sandbox-desktop:latest
+    entrypoint: ["true"]
+
+  # The only way out for desktop sandboxes. Each desktop sandbox gets its own internal
+  # network with just this proxy attached; the allowlists below decide what the
+  # browser may reach. Edit them and run `docker compose restart egress-proxy`.
+  egress-proxy:
+    image: ubuntu/squid:6.6-24.04_edge
+    container_name: intrallm-egress-proxy
+    volumes:
+      - ./deploy/egress-proxy/squid.conf:/etc/squid/squid.conf:ro
+      - ./deploy/egress-proxy/allowlist.txt:/etc/squid/allowlist.txt:ro
+      - ./deploy/egress-proxy/intranet-allowlist.txt:/etc/squid/intranet-allowlist.txt:ro
+      - egress-logs:/var/log/squid
+    restart: unless-stopped
+
   control-plane:
     build: .
     image: intrallm/sandbox-control:latest
-    depends_on: [sandbox-image]
+    depends_on: [sandbox-image, sandbox-desktop-image, egress-proxy]
     ports:
       - "8080:8080"
     environment:
@@ -18,6 +36,11 @@ services:
       SANDBOX_NETWORK: none
       SANDBOX_MAX_PER_OWNER: "5"
       SANDBOX_MAX_TOTAL: "100"
+      SANDBOX_DESKTOP_IMAGE: intrallm/sandbox-desktop:latest
+      SANDBOX_DESKTOP_NETWORK: isolated
+      SANDBOX_DESKTOP_NETWORK_PEERS: intrallm-egress-proxy
+      SANDBOX_DESKTOP_PROXY: http://intrallm-egress-proxy:3128
+      SANDBOX_MAX_DESKTOPS_PER_OWNER: "2"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - sandbox-data:/data
@@ -25,3 +48,4 @@ services:
 
 volumes:
   sandbox-data:
+  egress-logs:

@@ -2,7 +2,8 @@
 
 const REFRESH_MS = 5000;
 const $ = (id) => document.getElementById(id);
-const state = { token: null, me: null, sandboxes: [], summary: null, openId: null };
+const state = { token: null, me: null, sandboxes: [], summary: null, openId: null, openTemplate: null };
+const TEMPLATE = { code: "代码", desktop: "桌面" };
 
 // ---------------------------------------------------------------- helpers
 function getToken() { try { return localStorage.getItem("isb_token"); } catch { return null; } }
@@ -145,7 +146,7 @@ function renderRows() {
     const active = sb.status === "running" || sb.status === "creating";
     const end = sb.terminated_at || t;
     return `<tr data-id="${esc(sb.id)}">
-      <td><div class="sb-name">${esc(sb.name)}</div><div class="sb-id mono">${esc(sb.id)} · ${esc(sb.image)}</div></td>
+      <td><div class="sb-name">${esc(sb.name)}${sb.template === "desktop" ? `<span class="tag">桌面</span>` : ""}</div><div class="sb-id mono">${esc(sb.id)} · ${esc(sb.image)}</div></td>
       <td>${esc(sb.owner)}</td>
       <td class="muted">${esc(sb.created_by)}</td>
       <td><span class="pill ${esc(sb.status)}" title="${esc(sb.terminate_reason || "")}">${STATUS[sb.status] || esc(sb.status)}</span></td>
@@ -161,8 +162,13 @@ function renderRows() {
 // ---------------------------------------------------------------- drawer
 async function openDrawer(id) {
   state.openId = id;
+  state.openTemplate = null;
   $("drawer").hidden = false;
+  $("drawer").classList.remove("wide");
+  $("d-desktop").hidden = true;
   $("d-output").innerHTML = "";
+  $("d-takeover").checked = false;
+  setTakeover(false);
   await refreshDrawer();
 }
 
@@ -180,6 +186,7 @@ async function refreshDrawer() {
     ["状态", `<span class="pill ${esc(sb.status)}">${STATUS[sb.status] || esc(sb.status)}</span>${sb.terminate_reason ? ` <span class="muted">${esc(sb.terminate_reason)}</span>` : ""}`],
     ["分配给", esc(sb.owner)],
     ["创建者", esc(sb.created_by)],
+    ["类型", TEMPLATE[sb.template] || esc(sb.template)],
     ["镜像", `<span class="mono">${esc(sb.image)}</span>`],
     ["资源限制", `${sb.cpu} 核 · ${sb.memory_mb} MB`],
     ["创建时间", fmtDateTime(sb.created_at)],
@@ -199,16 +206,89 @@ async function refreshDrawer() {
 
   $("d-audit").innerHTML = audit.map((a) => {
     const d = a.detail || {};
-    const desc = d.command ? `$ ${d.command} → ${d.exit_code}` : d.reason || d.path || (d.owner ? `→ ${d.owner}` : "");
+    const desc = d.command ? `$ ${d.command} → ${d.exit_code}`
+      : d.reason || d.path || d.url || (d.owner ? `→ ${d.owner}` : "")
+      || (d.coordinate ? `@${d.coordinate.join(",")}` : "") || (d.ref ? `ref ${d.ref}` : "")
+      || (d.text_len != null ? `${d.text_len} 个字符` : "");
     return `<li><span class="t">${fmtTime(a.ts)}</span><span class="a">${esc(a.action)}</span><span class="d" title="${esc(desc)}">${esc(a.actor)} ${esc(desc)}</span></li>`;
   }).join("") || `<li class="muted">无记录</li>`;
 
+  const isDesktop = sb.template === "desktop";
+  $("d-desktop").hidden = !(isDesktop && active);
+  $("drawer").classList.toggle("wide", isDesktop && active);
+  if (state.openTemplate !== sb.template || !active) {
+    state.openTemplate = sb.template;
+    if (isDesktop && active) startScreen(); else stopScreen();
+  }
   $("d-console-card").hidden = !active;
   $("d-extend").hidden = !active;
   $("d-stop").hidden = !active;
 }
 
-function closeDrawer() { state.openId = null; $("drawer").hidden = true; }
+function closeDrawer() { state.openId = null; state.openTemplate = null; stopScreen(); $("drawer").hidden = true; }
+
+// ---------------------------------------------------------------- live desktop
+const SCREEN_MS = 1200;
+const screen = { timer: null, inflight: false, url: null, w: 1280, h: 800, typeBuf: "", typeTimer: null };
+
+function startScreen() {
+  stopScreen();
+  pollScreen();
+  screen.timer = setInterval(() => { if (!document.hidden) pollScreen(); }, SCREEN_MS);
+}
+function stopScreen() { clearInterval(screen.timer); screen.timer = null; }
+
+async function pollScreen() {
+  const id = state.openId;
+  if (!id || screen.inflight) return;
+  screen.inflight = true;
+  const t0 = performance.now();
+  try {
+    const res = await fetch(`/api/v1/sandboxes/${id}/desktop/screen?format=jpeg&quality=60`, {
+      headers: { Authorization: `Bearer ${state.token}` },
+    });
+    if (!res.ok || state.openId !== id) return;
+    const url = URL.createObjectURL(await res.blob());
+    const img = $("d-screen-img");
+    img.onload = () => { screen.w = img.naturalWidth; screen.h = img.naturalHeight; };
+    img.src = url;
+    if (screen.url) URL.revokeObjectURL(screen.url);
+    screen.url = url;
+    $("d-screen-meta").textContent = `${Math.round(performance.now() - t0)} ms`;
+  } catch { /* transient; next tick retries */ } finally { screen.inflight = false; }
+}
+
+function desktop(tool, body) {
+  return api(`/api/v1/sandboxes/${state.openId}/desktop/${tool}`, {
+    method: "POST", body: JSON.stringify({ screenshot: false, ...body }),
+  }).then(() => pollScreen()).catch((e) => { $("d-screen-meta").textContent = e.message; });
+}
+
+function setTakeover(on) {
+  $("d-screen").classList.toggle("control", on);
+  $("d-type-form").hidden = !on;
+  if (on) $("d-screen").focus();
+}
+
+function screenXY(e) {
+  const img = $("d-screen-img"), r = img.getBoundingClientRect();
+  // object-fit: contain may letterbox the image inside the element.
+  const scale = Math.min(r.width / screen.w, r.height / screen.h);
+  const ox = (r.width - screen.w * scale) / 2, oy = (r.height - screen.h * scale) / 2;
+  const x = Math.round((e.clientX - r.left - ox) / scale), y = Math.round((e.clientY - r.top - oy) / scale);
+  return x >= 0 && y >= 0 && x < screen.w && y < screen.h ? [x, y] : null;
+}
+
+const KEYMAP = { Enter: "Enter", Escape: "Escape", Backspace: "BackSpace", Tab: "Tab", Delete: "Delete",
+  ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right", Home: "Home", End: "End",
+  PageUp: "Prior", PageDown: "Next", " ": "space" };
+
+function flushTyping() {
+  clearTimeout(screen.typeTimer);
+  if (!screen.typeBuf) return;
+  const text = screen.typeBuf; screen.typeBuf = "";
+  desktop("computer", { action: "type", text });
+}
 
 async function stopSandbox(id) {
   if (!confirm(`确认停止并销毁沙箱 ${id}？工作区数据将被删除。`)) return;
@@ -303,12 +383,68 @@ $("d-console").onsubmit = async (e) => {
   out.scrollTop = out.scrollHeight;
   $("d-cmd").value = "";
 };
+$("d-takeover").onchange = (e) => setTakeover(e.target.checked);
+const scr = $("d-screen");
+let clickTimer = null;
+scr.addEventListener("click", (e) => {
+  if (!$("d-takeover").checked) return;
+  const xy = screenXY(e); if (!xy) return;
+  scr.focus();
+  clearTimeout(clickTimer);  // wait briefly so a double click isn't sent as two clicks
+  clickTimer = setTimeout(() => desktop("computer", { action: "left_click", coordinate: xy }), 220);
+});
+scr.addEventListener("dblclick", (e) => {
+  if (!$("d-takeover").checked) return;
+  clearTimeout(clickTimer);
+  const xy = screenXY(e); if (xy) desktop("computer", { action: "double_click", coordinate: xy });
+});
+scr.addEventListener("contextmenu", (e) => {
+  if (!$("d-takeover").checked) return;
+  e.preventDefault();
+  const xy = screenXY(e); if (xy) desktop("computer", { action: "right_click", coordinate: xy });
+});
+scr.addEventListener("wheel", (e) => {
+  if (!$("d-takeover").checked) return;
+  e.preventDefault();
+  const xy = screenXY(e); if (!xy) return;
+  desktop("computer", { action: "scroll", coordinate: xy, direction: e.deltaY < 0 ? "up" : "down", amount: 2 });
+}, { passive: false });
+scr.addEventListener("keydown", (e) => {
+  if (!$("d-takeover").checked) return;
+  e.preventDefault();
+  const mods = [e.ctrlKey && "ctrl", e.altKey && "alt", e.metaKey && "super"].filter(Boolean);
+  if (e.key.length === 1 && !mods.length) {
+    screen.typeBuf += e.key;
+    clearTimeout(screen.typeTimer);
+    screen.typeTimer = setTimeout(flushTyping, 150);
+    return;
+  }
+  const name = KEYMAP[e.key] || (/^F\d+$/.test(e.key) ? e.key : e.key.length === 1 ? e.key.toLowerCase() : null);
+  if (!name) return;  // lone modifier keys
+  flushTyping();
+  if (e.shiftKey && e.key.length !== 1) mods.push("shift");
+  desktop("computer", { action: "key", text: [...mods, name].join("+") });
+});
+$("d-type-form").onsubmit = (e) => {
+  e.preventDefault();
+  const text = $("d-type").value;
+  if (text) desktop("computer", { action: "type", text });
+  $("d-type").value = "";
+};
+document.querySelectorAll("[data-key]").forEach((b) => (b.onclick = () => desktop("computer", { action: "key", text: b.dataset.key })));
+$("c-template").onchange = (e) => {
+  const f = $("create-form"), desk = e.target.value === "desktop";
+  f.cpu.value = desk ? 2 : 1;
+  f.memory_mb.value = desk ? 2048 : 1024;
+};
+
 $("new-btn").onclick = () => { $("create-error").textContent = ""; $("create").hidden = false; };
 document.querySelectorAll("[data-close]").forEach((b) => (b.onclick = () => ($("create").hidden = true)));
 $("create-form").onsubmit = async (e) => {
   e.preventDefault();
   const f = new FormData(e.target);
   const body = {
+    template: f.get("template"),
     owner: f.get("owner") || null,
     name: f.get("name") || null,
     image: f.get("image") || null,
@@ -325,7 +461,9 @@ $("create-form").onsubmit = async (e) => {
   } catch (err) { $("create-error").textContent = err.message; }
 };
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { $("create").hidden = true; closeDrawer(); }
+  if (e.key === "Escape" && !(document.activeElement === scr && $("d-takeover").checked)) {
+    $("create").hidden = true; closeDrawer();
+  }
 });
 window.addEventListener("resize", () => { renderSummary(); if (state.openId) refreshDrawer().catch(() => {}); });
 

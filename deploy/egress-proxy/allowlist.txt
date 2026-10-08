@@ -1,0 +1,3 @@
+# Public domains desktop sandboxes may browse (one per line; a leading dot
+# includes subdomains). Empty = no internet access at all.
+.wikipedia.org

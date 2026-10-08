@@ -21,6 +21,12 @@ class SandboxSpec:
     env: dict[str, str] = field(default_factory=dict)
     labels: dict[str, str] = field(default_factory=dict)
     user: str = ""
+    # None = keep the image's own CMD (desktop images start their X server there).
+    command: list[str] | None = field(default_factory=lambda: ["sleep", "infinity"])
+    shm_size_mb: int | None = None
+    # With network == "isolated": containers (e.g. the egress proxy) to attach to the
+    # sandbox's own private network. They are the only peers the sandbox can reach.
+    network_peers: list[str] = field(default_factory=list)
 
 
 @dataclass

@@ -8,8 +8,9 @@ Example::
     kit = AgentToolkit(client, owner="alice")
 
     # 1. pass kit.tools to the LLM (OpenAI-compatible `tools=` parameter)
-    # 2. for each tool call the model emits:
-    result_json = kit.call(tool_call.function.name, tool_call.function.arguments)
+    # 2. for each tool call the model emits, append the returned messages
+    #    (a tool message, plus a user message carrying the screenshot if there is one):
+    messages += kit.messages(tool_call.id, tool_call.function.name, tool_call.function.arguments)
 """
 
 from __future__ import annotations
@@ -85,6 +86,18 @@ class SandboxClient:
     def destroy(self, sandbox_id: str) -> dict:
         return self._req("DELETE", f"/api/v1/sandboxes/{sandbox_id}")
 
+    def computer(self, sandbox_id: str, action: str, **args) -> dict:
+        return self._req("POST", f"/api/v1/sandboxes/{sandbox_id}/desktop/computer", json={"action": action, **args})
+
+    def browser(self, sandbox_id: str, action: str, **args) -> dict:
+        return self._req("POST", f"/api/v1/sandboxes/{sandbox_id}/desktop/browser", json={"action": action, **args})
+
+    def screen(self, sandbox_id: str, format: str = "png") -> bytes:
+        r = self._http.get(f"/api/v1/sandboxes/{sandbox_id}/desktop/screen", params={"format": format})
+        if r.status_code >= 400:
+            raise SandboxAPIError(r.status_code, r.text)
+        return r.content
+
     def tools(self) -> list[dict]:
         return self._req("GET", "/api/v1/agent/tools")
 
@@ -106,12 +119,65 @@ class AgentToolkit:
             self._tools = self.client.tools()
         return self._tools
 
-    def call(self, name: str, arguments: str | dict) -> str:
-        """Run one tool call and return a JSON string to feed back as the tool message."""
+    def run(self, name: str, arguments: str | dict) -> dict:
+        """Run one tool call; returns the raw result dict (may contain an ``image``)."""
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments or "{}")
             except json.JSONDecodeError as e:
-                return json.dumps({"ok": False, "error": f"arguments are not valid JSON: {e}"})
-        result = self.client.invoke(name, arguments, owner=self.owner)
-        return json.dumps(result, ensure_ascii=False)
+                return {"ok": False, "error": f"arguments are not valid JSON: {e}"}
+        return self.client.invoke(name, arguments, owner=self.owner)
+
+    def call(self, name: str, arguments: str | dict) -> str:
+        """Run one tool call and return a JSON string for the tool message (images stripped)."""
+        text, _ = _split_image(self.run(name, arguments))
+        return text
+
+    def messages(self, tool_call_id: str, name: str, arguments: str | dict) -> list[dict]:
+        """Run one tool call and return the chat messages to append.
+
+        OpenAI-compatible APIs only accept text in ``tool`` messages, so a screenshot
+        is sent as a follow-up ``user`` message with an ``image_url`` data URL.
+        """
+        text, image = _split_image(self.run(name, arguments))
+        msgs: list[dict] = [{"role": "tool", "tool_call_id": tool_call_id, "content": text}]
+        if image:
+            url = f"data:{image['media_type']};base64,{image['data']}"
+            msgs.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Screenshot after {name} ({tool_call_id}):"},
+                        {"type": "image_url", "image_url": {"url": url}},
+                    ],
+                }
+            )
+        return msgs
+
+
+def _split_image(result: dict) -> tuple[str, dict | None]:
+    image = None
+    inner = result.get("result")
+    if isinstance(inner, dict) and "image" in inner:
+        inner = dict(inner)
+        image = inner.pop("image")
+        inner["screenshot"] = "attached in the next message"
+        result = {**result, "result": inner}
+    return json.dumps(result, ensure_ascii=False), image
+
+
+def prune_screenshots(messages: list[dict], keep: int = 3) -> None:
+    """Drop all but the newest ``keep`` screenshots from a conversation, in place.
+
+    Screenshots dominate the context window; old ones rarely help the model.
+    """
+    seen = 0
+    for msg in reversed(messages):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list) or not any(p.get("type") == "image_url" for p in content):
+            continue
+        seen += 1
+        if seen > keep:
+            msg["content"] = [p for p in content if p.get("type") != "image_url"] + [
+                {"type": "text", "text": "[older screenshot removed]"}
+            ]

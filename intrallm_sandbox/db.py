@@ -14,6 +14,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS sandboxes (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
+    template        TEXT NOT NULL DEFAULT 'code',
     owner           TEXT NOT NULL,
     created_by      TEXT NOT NULL,
     status          TEXT NOT NULL,
@@ -80,6 +81,12 @@ class Database:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(sandboxes)")}
+        if "template" not in cols:
+            self._conn.execute("ALTER TABLE sandboxes ADD COLUMN template TEXT NOT NULL DEFAULT 'code'")
 
     def _q(self, sql: str, params: tuple = ()) -> list[dict[str, Any]]:
         with self._lock:
@@ -142,12 +149,15 @@ class Database:
         sql += " ORDER BY created_at DESC LIMIT ?"
         return self._q(sql, (*params, limit))
 
-    def count_active(self, owner: str | None = None) -> int:
+    def count_active(self, owner: str | None = None, template: str | None = None) -> int:
         sql = f"SELECT COUNT(*) AS n FROM sandboxes WHERE status IN ({','.join('?' * len(ACTIVE_STATUSES))})"
         params: tuple = ACTIVE_STATUSES
         if owner:
             sql += " AND owner=?"
             params = (*params, owner)
+        if template:
+            sql += " AND template=?"
+            params = (*params, template)
         return self._q(sql, params)[0]["n"]
 
     def status_counts(self) -> dict[str, int]:

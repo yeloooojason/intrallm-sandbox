@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""In-sandbox desktop controller, invoked by the control plane via `docker exec`.
+
+    desktopctl '{"action": "left_click", "coordinate": [640, 400]}'
+
+Prints one JSON object on stdout: {"ok": true, ...} or {"ok": false, "error": "..."}.
+
+Computer actions (X XTEST extension via python-xlib) and browser actions
+(Playwright over CDP) operate on the same visible Chromium window, so an agent
+can mix them freely.
+"""
+
+from __future__ import annotations
+
+import base64
+import io
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+
+DISPLAY = os.environ.get("DISPLAY", ":1")
+WIDTH = int(os.environ.get("SCREEN_WIDTH", "1280"))
+HEIGHT = int(os.environ.get("SCREEN_HEIGHT", "800"))
+CDP_PORT = 9222
+CDP = f"http://127.0.0.1:{CDP_PORT}"
+PROFILE = os.path.expanduser("~/.chromium-profile")
+SETTLE = 0.4  # seconds to let the UI react before an automatic screenshot
+
+
+class ActionError(Exception):
+    pass
+
+
+# ----------------------------------------------------------------- X11
+_display = None
+
+
+def xdisplay():
+    global _display
+    if _display is None:
+        from Xlib import display
+
+        try:
+            _display = display.Display(DISPLAY)
+        except Exception as e:
+            raise ActionError(f"cannot open display {DISPLAY}: {e}") from e
+    return _display
+
+
+def screenshot(fmt: str = "png", quality: int = 70, max_width: int | None = None) -> dict:
+    from PIL import Image
+    from Xlib import X
+
+    d = xdisplay()
+    geo = d.screen().root.get_geometry()
+    raw = d.screen().root.get_image(0, 0, geo.width, geo.height, X.ZPixmap, 0xFFFFFFFF)
+    img = Image.frombytes("RGB", (geo.width, geo.height), raw.data, "raw", "BGRX")
+    if max_width and img.width > int(max_width):
+        max_width = int(max_width)
+        img = img.resize((max_width, round(img.height * max_width / img.width)))
+    buf = io.BytesIO()
+    fmt = "jpeg" if fmt in ("jpg", "jpeg") else "png"
+    img.save(buf, format=fmt.upper(), **({"quality": int(quality)} if fmt == "jpeg" else {}))
+    return {
+        "image": {"media_type": f"image/{fmt}", "data": base64.b64encode(buf.getvalue()).decode()},
+        "width": img.width,
+        "height": img.height,
+    }
+
+
+def _fake(event_type, detail=0, **kw):
+    from Xlib.ext import xtest
+
+    xtest.fake_input(xdisplay(), event_type, detail, **kw)
+
+
+def move(x: int, y: int) -> None:
+    from Xlib import X
+
+    _fake(X.MotionNotify, x=x, y=y)
+    xdisplay().sync()
+
+
+def click(button: int, repeat: int = 1, delay: float = 0.08) -> None:
+    from Xlib import X
+
+    for i in range(repeat):
+        _fake(X.ButtonPress, button)
+        _fake(X.ButtonRelease, button)
+        xdisplay().sync()
+        if i + 1 < repeat:
+            time.sleep(delay)
+
+
+def button(btn: int, down: bool) -> None:
+    from Xlib import X
+
+    _fake(X.ButtonPress if down else X.ButtonRelease, btn)
+    xdisplay().sync()
+
+
+KEY_ALIASES = {
+    "enter": "Return", "return": "Return", "esc": "Escape", "escape": "Escape", "tab": "Tab",
+    "backspace": "BackSpace", "delete": "Delete", "del": "Delete", "space": "space",
+    "up": "Up", "down": "Down", "left": "Left", "right": "Right", "home": "Home", "end": "End",
+    "pageup": "Prior", "pagedown": "Next", "insert": "Insert",
+    "ctrl": "Control_L", "control": "Control_L", "alt": "Alt_L", "shift": "Shift_L",
+    "cmd": "Super_L", "meta": "Super_L", "super": "Super_L", "win": "Super_L",
+}
+
+
+def keysym_for(name: str) -> int:
+    from Xlib import XK
+
+    low = name.lower()
+    if low in KEY_ALIASES:
+        name = KEY_ALIASES[low]
+    elif len(low) > 1 and low[0] == "f" and low[1:].isdigit():
+        name = low.upper()
+    if len(name) == 1:
+        return char_keysym(name)
+    ks = XK.string_to_keysym(name)
+    if not ks:
+        raise ActionError(f"unknown key {name!r}")
+    return ks
+
+
+def char_keysym(c: str) -> int:
+    from Xlib import XK
+
+    if c == "\n":
+        return XK.string_to_keysym("Return")
+    if c == "\t":
+        return XK.string_to_keysym("Tab")
+    cp = ord(c)
+    # Latin-1 keysyms equal their code points; everything else uses the Unicode range.
+    return cp if 0x20 <= cp <= 0x7E or 0xA0 <= cp <= 0xFF else 0x01000000 + cp
+
+
+class Keyboard:
+    """Sends keysyms with XTEST, temporarily remapping a spare keycode for characters
+    the keymap lacks (CJK, emoji...), like xdotool does."""
+
+    def __init__(self):
+        from Xlib import X, XK
+
+        self.X, self.XK = X, XK
+        d = xdisplay()
+        self.d = d
+        self.shift = d.keysym_to_keycode(XK.string_to_keysym("Shift_L"))
+        lo, hi = d.display.info.min_keycode, d.display.info.max_keycode
+        mapping = d.get_keyboard_mapping(lo, hi - lo + 1)
+        self.spare = next((lo + i for i, syms in enumerate(mapping) if not any(syms)), hi)
+        self.spare_orig = mapping[self.spare - lo]
+
+    def _press(self, kc, down):
+        _fake(self.X.KeyPress if down else self.X.KeyRelease, kc)
+
+    def lookup(self, ks):
+        for kc, idx in self.d.keysym_to_keycodes(ks):
+            if idx in (0, 1):
+                return kc, idx == 1
+        return None, False
+
+    def tap_keysym(self, ks, modifiers=()):
+        kc, need_shift = self.lookup(ks)
+        remapped = kc is None
+        if remapped:
+            kc, need_shift = self.spare, False
+            self.d.change_keyboard_mapping(kc, [(ks,) * max(1, len(self.spare_orig))])
+            self.d.sync()
+            time.sleep(0.02)
+        mods = list(modifiers) + ([self.shift] if need_shift else [])
+        for m in mods:
+            self._press(m, True)
+        self._press(kc, True)
+        self._press(kc, False)
+        for m in reversed(mods):
+            self._press(m, False)
+        self.d.sync()
+        if remapped:
+            time.sleep(0.02)
+            self.d.change_keyboard_mapping(kc, [self.spare_orig])
+            self.d.sync()
+
+    def combo(self, combo: str):
+        parts = [p.strip() for p in combo.split("+")]
+        if not all(parts):
+            raise ActionError(f"bad key combo {combo!r}")
+        *mods, key = parts
+        mod_codes = []
+        for m in mods:
+            kc = self.d.keysym_to_keycode(keysym_for(m))
+            if not kc:
+                raise ActionError(f"unknown modifier {m!r}")
+            mod_codes.append(kc)
+        self.tap_keysym(keysym_for(key), mod_codes)
+
+    def type(self, text: str, delay: float = 0.008):
+        for c in text:
+            self.tap_keysym(char_keysym(c))
+            time.sleep(delay)
+
+
+def _xy(a: dict, key: str = "coordinate") -> tuple[int, int] | None:
+    c = a.get(key)
+    if c is None:
+        return None
+    if not (isinstance(c, (list, tuple)) and len(c) == 2):
+        raise ActionError(f"{key} must be [x, y]")
+    x, y = int(c[0]), int(c[1])
+    if not (0 <= x < WIDTH and 0 <= y < HEIGHT):
+        raise ActionError(f"{key} {[x, y]} is outside the {WIDTH}x{HEIGHT} screen")
+    return x, y
+
+
+def _require_xy(a: dict) -> tuple[int, int]:
+    xy = _xy(a)
+    if xy is None:
+        raise ActionError("coordinate [x, y] is required")
+    return xy
+
+
+BUTTONS = {"left_click": (1, 1), "right_click": (3, 1), "middle_click": (2, 1), "double_click": (1, 2), "triple_click": (1, 3)}
+SCROLL = {"up": 4, "down": 5, "left": 6, "right": 7}
+
+
+def computer(a: dict) -> dict:
+    act = a["action"]
+    if act == "screenshot":
+        return screenshot(a.get("format", "png"), a.get("quality", 70), a.get("max_width"))
+    if act == "cursor_position":
+        p = xdisplay().screen().root.query_pointer()
+        return {"x": p.root_x, "y": p.root_y}
+    if act in BUTTONS:
+        btn, repeat = BUTTONS[act]
+        xy = _xy(a)
+        if xy:
+            move(*xy)
+        click(btn, repeat)
+    elif act == "mouse_move":
+        move(*_require_xy(a))
+    elif act == "left_click_drag":
+        start = _xy(a, "start_coordinate")
+        if start:
+            move(*start)
+        button(1, True)
+        end = _require_xy(a)
+        move(*end)
+        time.sleep(0.05)
+        button(1, False)
+    elif act == "type":
+        text = a.get("text")
+        if not isinstance(text, str) or not text:
+            raise ActionError("text is required")
+        Keyboard().type(text)
+    elif act == "key":
+        keys = str(a.get("text") or a.get("key") or "").split()
+        if not keys:
+            raise ActionError("text (key combo, e.g. 'ctrl+l') is required")
+        kb = Keyboard()
+        for k in keys:
+            kb.combo(k)
+            time.sleep(0.05)
+    elif act == "scroll":
+        xy = _xy(a)
+        if xy:
+            move(*xy)
+        direction = a.get("direction", "down")
+        if direction not in SCROLL:
+            raise ActionError("direction must be up/down/left/right")
+        click(SCROLL[direction], max(1, min(int(a.get("amount", 3)), 50)), delay=0.03)
+    elif act == "wait":
+        time.sleep(min(float(a.get("seconds", 1)), 30))
+    else:
+        raise ActionError(f"unknown computer action {act!r}")
+    if a.get("screenshot", True):
+        time.sleep(SETTLE)
+        return screenshot(a.get("format", "png"), a.get("quality", 70), a.get("max_width"))
+    return {}
+
+
+# ----------------------------------------------------------------- browser
+def cdp_alive() -> bool:
+    try:
+        with urllib.request.urlopen(f"{CDP}/json/version", timeout=1) as r:
+            return r.status == 200
+    except Exception:
+        return False
+
+
+def browser_start() -> dict:
+    if cdp_alive():
+        return {"started": False}
+    args = [
+        "chromium",
+        f"--remote-debugging-port={CDP_PORT}",
+        "--remote-debugging-address=127.0.0.1",
+        f"--user-data-dir={PROFILE}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-features=Translate,MediaRouter",
+        "--disable-session-crashed-bubble",
+        "--password-store=basic",
+        "--window-position=0,0",
+        f"--window-size={WIDTH},{HEIGHT}",
+        "--start-maximized",
+        # The container is the security boundary; Chromium's own sandbox needs
+        # user namespaces that hardened containers do not grant.
+        "--no-sandbox",
+        "--test-type",  # hides the --no-sandbox warning bar so the page area stays stable
+    ]
+    proxy = os.environ.get("BROWSER_PROXY")
+    if proxy:
+        args += [f"--proxy-server={proxy}", "--proxy-bypass-list=<-loopback>"]
+    args.append(os.environ.get("BROWSER_HOME", "about:blank"))
+    subprocess.Popen(
+        args, stdout=subprocess.DEVNULL, stderr=open("/tmp/chromium.log", "ab"), start_new_session=True
+    )
+    for _ in range(150):
+        if cdp_alive():
+            return {"started": True}
+        time.sleep(0.1)
+    raise ActionError("chromium did not start (see /tmp/chromium.log)")
+
+
+SNAPSHOT_JS = r"""
+(maxText) => {
+  const SEL = 'a[href],button,input:not([type=hidden]),select,textarea,summary,' +
+    '[role=button],[role=link],[role=checkbox],[role=radio],[role=tab],[role=menuitem],' +
+    '[role=option],[role=combobox],[role=textbox],[role=switch],[contenteditable=""],' +
+    '[contenteditable=true],[onclick]';
+  document.querySelectorAll('[data-ilr]').forEach(e => e.removeAttribute('data-ilr'));
+  const top = window.screenY + (window.outerHeight - window.innerHeight);
+  const out = [];
+  for (const el of document.querySelectorAll(SEL)) {
+    if (out.length >= 400) break;
+    const r = el.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) continue;
+    const st = getComputedStyle(el);
+    if (st.visibility === 'hidden' || st.display === 'none' || el.disabled) continue;
+    const ref = out.length + 1;
+    el.setAttribute('data-ilr', String(ref));
+    const tag = el.tagName.toLowerCase();
+    const role = el.getAttribute('role') || (tag === 'input' ? `input[${el.type}]` : tag);
+    const label = el.labels && el.labels[0] ? el.labels[0].innerText : '';
+    const name = (el.getAttribute('aria-label') || label || el.innerText || el.placeholder ||
+                  el.title || el.alt || el.name || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    const inView = r.bottom > 0 && r.top < innerHeight && r.right > 0 && r.left < innerWidth;
+    const item = { ref, role, name, in_view: inView };
+    if ('value' in el && el.value && tag !== 'button') item.value = String(el.value).slice(0, 80);
+    if (el.checked) item.checked = true;
+    if (inView) item.screen = [Math.round(window.screenX + r.left + r.width / 2), Math.round(top + r.top + r.height / 2)];
+    out.push(item);
+  }
+  const text = (document.body ? document.body.innerText : '').replace(/\n{3,}/g, '\n\n');
+  return { url: location.href, title: document.title, elements: out,
+           text: text.slice(0, maxText), text_truncated: text.length > maxText };
+}
+"""
+
+
+def _format_snapshot(s: dict) -> str:
+    lines = [f"URL: {s['url']}", f"Title: {s['title']}", "", "Interactive elements ([ref] role \"name\" @screen x,y):"]
+    for e in s["elements"]:
+        extra = ""
+        if "value" in e:
+            extra += f" value={e['value']!r}"
+        if e.get("checked"):
+            extra += " checked"
+        where = f" @{e['screen'][0]},{e['screen'][1]}" if "screen" in e else " (off-screen)"
+        lines.append(f"[{e['ref']}] {e['role']} \"{e['name']}\"{extra}{where}")
+    lines += ["", "Page text:", s["text"] + (" …(truncated)" if s["text_truncated"] else "")]
+    return "\n".join(lines)
+
+
+def _front_target_id() -> str | None:
+    # Chrome lists page targets most-recently-activated first, which tracks tab
+    # switches made with the mouse/keyboard too. (document.visibilityState can't be
+    # used: Playwright emulates focus on every page it attaches to.)
+    try:
+        with urllib.request.urlopen(f"{CDP}/json/list", timeout=2) as r:
+            return next((t["id"] for t in json.load(r) if t.get("type") == "page"), None)
+    except Exception:
+        return None
+
+
+def _active_page(ctx):
+    pages = ctx.pages
+    if not pages:
+        return ctx.new_page()
+    front = _front_target_id()
+    if front:
+        for p in pages:
+            try:
+                session = ctx.new_cdp_session(p)
+                target_id = session.send("Target.getTargetInfo")["targetInfo"]["targetId"]
+                session.detach()
+            except Exception:
+                continue
+            if target_id == front:
+                return p
+    return pages[-1]
+
+
+def browser(a: dict) -> dict:
+    from playwright.sync_api import Error as PWError
+    from playwright.sync_api import sync_playwright
+
+    act = a["action"]
+    browser_start()
+    with sync_playwright() as pw:
+        b = pw.chromium.connect_over_cdp(CDP)
+        ctx = b.contexts[0] if b.contexts else b.new_context()
+        page = _active_page(ctx)
+        timeout = int(float(a.get("timeout", 15)) * 1000)
+        page.set_default_timeout(timeout)
+        max_text = int(a.get("max_text", 4000))
+
+        def loc(ref):
+            if ref is None:
+                raise ActionError("ref is required (from a browser snapshot)")
+            l = page.locator(f'[data-ilr="{int(ref)}"]')
+            if l.count() == 0:
+                raise ActionError(f"ref {ref} not found; the page changed, take a new snapshot")
+            return l.first
+
+        def settle():
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=timeout)
+            except PWError:
+                pass
+            time.sleep(SETTLE)
+
+        try:
+            if act == "navigate":
+                url = a.get("url") or ""
+                if "://" not in url and not url.startswith("about:"):
+                    url = "https://" + url
+                page.goto(url, wait_until="domcontentloaded", timeout=max(timeout, 30000))
+            elif act == "snapshot":
+                pass
+            elif act == "click":
+                loc(a.get("ref")).click()
+            elif act == "fill":
+                l = loc(a.get("ref"))
+                l.fill(str(a.get("text", "")))
+                if a.get("submit"):
+                    l.press("Enter")
+            elif act == "select":
+                loc(a.get("ref")).select_option(str(a.get("value", "")))
+            elif act == "press":
+                page.keyboard.press(str(a.get("key", "Enter")))
+            elif act == "scroll":
+                dy = int(a.get("amount", 600)) * (-1 if a.get("direction") == "up" else 1)
+                page.mouse.wheel(0, dy)
+            elif act == "back":
+                page.go_back()
+            elif act == "forward":
+                page.go_forward()
+            elif act == "wait_for":
+                if a.get("text"):
+                    page.get_by_text(str(a["text"])).first.wait_for(timeout=timeout)
+                else:
+                    time.sleep(min(float(a.get("seconds", 1)), 30))
+            elif act == "tabs":
+                return {"tabs": [{"index": i, "url": p.url, "title": p.title(), "active": p == page} for i, p in enumerate(ctx.pages)]}
+            elif act in ("switch_tab", "close_tab"):
+                idx = int(a.get("index", -1))
+                try:
+                    target = ctx.pages[idx]
+                except IndexError:
+                    raise ActionError(f"no tab at index {idx}")
+                if act == "close_tab":
+                    target.close()
+                    page = _active_page(ctx)
+                else:
+                    page = target
+                page.bring_to_front()
+            elif act == "new_tab":
+                page = ctx.new_page()
+                page.bring_to_front()
+                if a.get("url"):
+                    page.goto(a["url"], wait_until="domcontentloaded", timeout=max(timeout, 30000))
+            else:
+                raise ActionError(f"unknown browser action {act!r}")
+            settle()
+            snap = page.evaluate(SNAPSHOT_JS, max_text)
+        except PWError as e:
+            raise ActionError(str(e).splitlines()[0]) from e
+        return {"url": snap["url"], "title": snap["title"], "snapshot": _format_snapshot(snap), "element_count": len(snap["elements"])}
+
+
+# ----------------------------------------------------------------- main
+def x_alive() -> bool:
+    global _display
+    try:
+        xdisplay()
+        return True
+    except ActionError:
+        _display = None
+        return False
+
+
+def wait_ready(timeout: float = 30, need_browser: bool = True) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if x_alive() and (not need_browser or cdp_alive()):
+            return {"ready": True, "screen": [WIDTH, HEIGHT]}
+        time.sleep(0.2)
+    raise ActionError("desktop did not become ready")
+
+
+def main() -> int:
+    try:
+        a = json.loads(sys.argv[1] if len(sys.argv) > 1 else "{}")
+        act = a.get("action")
+        if act == "wait_ready":
+            res = wait_ready(float(a.get("timeout", 30)))
+        elif act == "wait_x":
+            res = wait_ready(float(a.get("timeout", 15)), need_browser=False)
+        elif act == "browser_start":
+            res = browser_start()
+        elif a.get("tool") == "browser":
+            res = browser(a)
+        else:
+            res = computer(a)
+        print(json.dumps({"ok": True, **res}, ensure_ascii=False))
+        return 0
+    except (ActionError, KeyError, ValueError, TypeError) as e:
+        msg = f"missing argument: {e.args[0]}" if isinstance(e, KeyError) else str(e)
+        print(json.dumps({"ok": False, "error": msg}, ensure_ascii=False))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

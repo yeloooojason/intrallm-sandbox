@@ -34,10 +34,12 @@ SANDBOX_ID = {"type": "string", "description": "Sandbox id returned by sandbox_c
 TOOLS: list[dict] = [
     _fn(
         "sandbox_create",
-        "Create an isolated Linux sandbox (container) to run code or shell commands for the current user. "
-        "Reuse an existing sandbox for the same task instead of creating a new one.",
+        "Create an isolated Linux sandbox (container) for the current user. template='code' gives a shell "
+        "for running code; template='desktop' adds a virtual screen with a Chromium browser that you can "
+        "operate with the `computer` and `browser` tools. Reuse an existing sandbox for the same task.",
         {
             "name": {"type": "string", "description": "Short human readable name for the task"},
+            "template": {"type": "string", "enum": ["code", "desktop"], "description": "Default: code"},
             "image": {"type": "string", "description": "Container image; omit for the default"},
             "cpu": {"type": "number", "description": "CPU cores, e.g. 1"},
             "memory_mb": {"type": "integer", "description": "Memory limit in MB, e.g. 1024"},
@@ -85,6 +87,69 @@ TOOLS: list[dict] = [
         [],
     ),
     _fn(
+        "computer",
+        "Operate the virtual desktop of a desktop sandbox like a human: look at the screen and use the "
+        "mouse and keyboard. Screen is 1280x800, origin top-left. Every action except cursor_position "
+        "returns a fresh screenshot unless screenshot=false. Prefer the `browser` tool for web pages "
+        "(faster, more reliable); use `computer` for anything it cannot do (canvas, native dialogs, "
+        "visual checks, non-browser apps).",
+        {
+            "sandbox_id": SANDBOX_ID,
+            "action": {
+                "type": "string",
+                "enum": [
+                    "screenshot", "left_click", "right_click", "middle_click", "double_click", "triple_click",
+                    "mouse_move", "left_click_drag", "type", "key", "scroll", "cursor_position", "wait",
+                ],
+            },
+            "coordinate": {
+                "type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2,
+                "description": "[x, y] for clicks, mouse_move, scroll position and the drag end point",
+            },
+            "start_coordinate": {
+                "type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2,
+                "description": "[x, y] drag start for left_click_drag",
+            },
+            "text": {
+                "type": "string",
+                "description": "Text for `type` (any language), or space separated key combos for `key`, "
+                "e.g. 'ctrl+l', 'Enter', 'ctrl+shift+t'",
+            },
+            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+            "amount": {"type": "integer", "description": "Scroll clicks, default 3"},
+            "seconds": {"type": "number", "description": "Duration for wait"},
+            "screenshot": {"type": "boolean", "description": "Return a screenshot after the action (default true)"},
+        },
+        ["sandbox_id", "action"],
+    ),
+    _fn(
+        "browser",
+        "Drive the Chromium browser of a desktop sandbox with Playwright. It is the same browser that is "
+        "visible on the desktop. Actions return a text snapshot: the URL, a numbered list of interactive "
+        "elements ([ref] role \"name\" @screen x,y) and the page text. Use `ref` numbers from the latest "
+        "snapshot to click/fill; the screen coordinates can be used with the `computer` tool.",
+        {
+            "sandbox_id": SANDBOX_ID,
+            "action": {
+                "type": "string",
+                "enum": [
+                    "navigate", "snapshot", "click", "fill", "select", "press", "scroll", "back", "forward",
+                    "wait_for", "tabs", "new_tab", "switch_tab", "close_tab",
+                ],
+            },
+            "url": {"type": "string", "description": "For navigate / new_tab"},
+            "ref": {"type": "integer", "description": "Element number from the latest snapshot"},
+            "text": {"type": "string", "description": "Text for fill, or text to wait_for"},
+            "submit": {"type": "boolean", "description": "Press Enter after fill"},
+            "value": {"type": "string", "description": "Option value or label for select"},
+            "key": {"type": "string", "description": "Key for press, e.g. Enter, Escape, Control+A"},
+            "direction": {"type": "string", "enum": ["up", "down"]},
+            "index": {"type": "integer", "description": "Tab index for switch_tab / close_tab"},
+            "max_text": {"type": "integer", "description": "Max characters of page text (default 4000)"},
+        },
+        ["sandbox_id", "action"],
+    ),
+    _fn(
         "sandbox_destroy",
         "Destroy a sandbox when the task is finished, releasing its resources.",
         {"sandbox_id": SANDBOX_ID},
@@ -110,13 +175,13 @@ def invoke(manager: SandboxManager, principal: Principal, owner: str | None, too
 
 
 def _brief(sb: dict) -> dict:
-    keys = ("id", "name", "owner", "status", "image", "cpu", "memory_mb", "expires_at")
+    keys = ("id", "name", "template", "owner", "status", "image", "cpu", "memory_mb", "expires_at")
     return {k: sb[k] for k in keys}
 
 
 def _dispatch(m: SandboxManager, p: Principal, owner: str | None, tool: str, a: dict) -> Any:
     if tool == "sandbox_create":
-        allowed = {"name", "image", "cpu", "memory_mb", "ttl_seconds"}
+        allowed = {"name", "template", "image", "cpu", "memory_mb", "ttl_seconds"}
         return _brief(m.create(p, owner=owner, **{k: v for k, v in a.items() if k in allowed}))
     if tool == "sandbox_list":
         return [_brief(sb) for sb in m.list(p, active_only=True, owner=owner)]
@@ -126,6 +191,8 @@ def _dispatch(m: SandboxManager, p: Principal, owner: str | None, tool: str, a: 
     # An agent acting for user X must not touch user Y's sandbox even if it created it.
     if owner and m.get(p, sid)["owner"] != owner:
         raise SandboxError(f"sandbox {sid} not found")
+    if tool in ("computer", "browser"):
+        return m.desktop_action(p, sid, tool, {k: v for k, v in a.items() if k != "sandbox_id"})
     if tool == "sandbox_exec":
         return asdict(m.exec(p, sid, a["command"], a.get("timeout"), a.get("workdir")))
     if tool == "sandbox_write_file":

@@ -1,0 +1,11 @@
+#!/bin/sh
+# Container entrypoint: virtual screen, optional window manager, then the browser.
+Xvfb "$DISPLAY" -screen 0 "${SCREEN_WIDTH}x${SCREEN_HEIGHT}x24" -nolisten tcp >/tmp/xvfb.log 2>&1 &
+XVFB_PID=$!
+desktopctl '{"action":"wait_x"}' >/dev/null
+if command -v openbox >/dev/null 2>&1; then
+  openbox >/tmp/openbox.log 2>&1 &
+fi
+desktopctl '{"action":"browser_start"}' >/dev/null 2>&1
+# Stay alive as long as the X server does.
+wait "$XVFB_PID"

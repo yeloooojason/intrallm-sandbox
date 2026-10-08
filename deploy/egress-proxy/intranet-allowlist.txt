@@ -1,0 +1,4 @@
+# Internal systems desktop sandboxes may reach. Internal addresses are blocked
+# unless the domain is listed here. Example:
+# .oa.corp.example.com
+# wiki.corp.example.com
